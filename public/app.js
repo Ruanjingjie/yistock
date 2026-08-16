@@ -1161,7 +1161,7 @@ async function refreshSnapshot() {
     if (triggered) {
       showToast('已触发服务端扫描，正在重新拉取最新快照…');
     } else {
-      showToast('当前为静态托管，无自动扫描后端：刷新仅重新拉取已部署的快照。如需每日自动更新，需部署常驻 Node 后端。');
+      showToast('当前为静态部署，刷新仅重新加载已部署的快照。每日自动更新由部署流水线（GitHub Actions 定时任务）完成，无需常驻后端。');
     }
   } catch (e) {
     showToast('刷新失败：未检测到扫描后端（服务端未运行）。');
