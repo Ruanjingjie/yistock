@@ -1114,9 +1114,9 @@ let currentSnapshotMeta = null;
 async function loadSnapshot(type = currentType) {
   if (snapshotBarEl) snapshotBarEl.style.display = 'block';
   try {
-    let res = await fetch(`/snapshot_${type}.json?t=${Date.now()}`);
+    let res = await fetch(`./snapshot_${type}.json?t=${Date.now()}`);
     // A股历史快照文件名可能是 snapshot.json，做一次兼容回退
-    if (!res.ok && type === 'stock') res = await fetch(`/snapshot.json?t=${Date.now()}`);
+    if (!res.ok && type === 'stock') res = await fetch(`./snapshot.json?t=${Date.now()}`);
     if (!res.ok) throw new Error('no snapshot');
     const snap = await res.json();
     currentSnapshotMeta = snap;
