@@ -8,7 +8,7 @@ const path = require('path');
 
 const PUBLIC_DIR = path.join(__dirname, 'public');
 const SNAPSHOT_PATHS = {
-  stock: path.join(PUBLIC_DIR, 'snapshot.json'),
+  stock: path.join(PUBLIC_DIR, 'snapshot_stock.json'),
   cb: path.join(PUBLIC_DIR, 'snapshot_cb.json'),
   etf: path.join(PUBLIC_DIR, 'snapshot_etf.json'),
 };
