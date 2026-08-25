@@ -1,0 +1,49 @@
+name: 每日扫描并部署到 GitHub Pages
+
+on:
+  # 每个工作日 14:30（北京时间 = UTC 6:30）自动跑，收盘即扫描
+  schedule:
+    - cron: '30 6 * * 1-5'
+  # 也支持在 Actions 页面手动触发（点 "Run workflow"）
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: daily-scan
+  cancel-in-progress: true
+
+jobs:
+  scan-and-deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: 安装 Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: 运行每日扫描（stock/cb/etf/precursor + 复盘 + 参数统计 + 经验总结 + 回测）
+        run: node scanner.js
+
+      - name: 把新生成的数据提交回 main（供下次复盘累积）
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add public/
+          git diff --cached --quiet && echo "无数据变化，跳过提交" || git commit -m "daily scan $(date -u +%Y-%m-%d)"
+          git push
+
+      - name: 部署到 GitHub Pages
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./public
+          publish_branch: gh-pages
+          force_orphan: true
