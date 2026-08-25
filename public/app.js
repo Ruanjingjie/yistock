@@ -1,6 +1,11 @@
 // ============ 全局状态 ============
 let stockPool = [];
 let scanResults = [];
+let topTenSet = new Set();  // 综合分最高的前 10 只 code 集合（用于高亮前十）
+let globalBirth = (function () { try { return localStorage.getItem('sg_meihua_birth') || ''; } catch (e) { return ''; } })(); // 梅花易数全局生辰（仅输入一次）
+let manualEventsCache = [];            // 前端加载的 manual_events.json（手动注入）
+let autoNewsCache = [];                // 前端加载的 news_cache.json（自动抓取相关新闻）
+const meihuaCache = new Map();         // 梅花易数结果缓存：key = 生辰|代码|事件文本
 // 屏蔽退市 / 长期停牌股（默认开；true=剔除名称含"退"且 K 线最新交易日过旧者）
 let blockDelisted = localStorage.getItem('sg_blockDelisted') !== '0';
 let includeFlow = localStorage.getItem('sg_includeFlow') !== '0';
@@ -8,8 +13,36 @@ let flowOnlyIn = localStorage.getItem('sg_flowOnlyIn') === '1';
 let currentFilter = 'all';
 let currentType = 'stock';        // stock | cb | etf
 let currentBoardFilter = 'all';   // all | main | cyb | kcb（仅 A股）
+let currentTechFilter = 'all';    // all | buy | sell（技术推荐：入/出）
+let currentHexFilter = 'all';     // all | in | out（易经推荐：入/出）
 let klineChartInstance = null;
 let derivativeChartInstance = null;
+function escapeHtml(s) {
+  return String(s == null ? '' : s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
+
+// ===== 趋势预判文案（内部版 / 对外模糊） =====
+// INTERNAL_VER = true 时显示具体方向与操作参考；对外发布改 false，自动降级为模糊话术。
+const INTERNAL_VER = true;
+const HEX_TREND_TXT = {
+  多: INTERNAL_VER
+    ? { label: '偏多 📈', txt: '预判短线趋势向上', action: '操作参考：可关注 3-5 日内低吸机会' }
+    : { label: '偏多 📈', txt: '卦象偏多', action: '仅供娱乐，不构成投资建议' },
+  空: INTERNAL_VER
+    ? { label: '偏空 📉', txt: '预判短线趋势向下', action: '操作参考：注意回避，等待企稳信号' }
+    : { label: '偏空 📉', txt: '卦象偏空', action: '仅供娱乐，不构成投资建议' },
+  观: INTERNAL_VER
+    ? { label: '中性观望 ⚖️', txt: '预判方向未明', action: '操作参考：建议观望，勿追涨杀跌' }
+    : { label: '中性观望 ⚖️', txt: '卦象中性', action: '仅供娱乐，不构成投资建议' },
+};
+const MEIHUA_TREND_TXT = {
+  '用生体': INTERNAL_VER ? { txt: '预判向好', action: '外力相济，可顺势把握机会' } : { txt: '卦象相生', action: '仅供娱乐' },
+  '体克用': INTERNAL_VER ? { txt: '预判偏强', action: '可图可为，但须审时度势' } : { txt: '卦象相克', action: '仅供娱乐' },
+  '比和':   INTERNAL_VER ? { txt: '预判震荡', action: '内外相安，宜守静待变' } : { txt: '卦象平和', action: '仅供娱乐' },
+  '体生用': INTERNAL_VER ? { txt: '预判转弱', action: '我力外耗，宜蓄力观望' } : { txt: '卦象偏弱', action: '仅供娱乐' },
+  '用克体': INTERNAL_VER ? { txt: '预判走弱', action: '外界相逼，宜避让守拙' } : { txt: '卦象受制', action: '仅供娱乐' },
+  '平':     INTERNAL_VER ? { txt: '方向未明', action: '宜观望等待' } : { txt: '卦象中性', action: '仅供娱乐' },
+};
 
 const DEFAULT_STOCKS = [
   { code: 'sz000001', name: '平安银行' },
@@ -416,6 +449,34 @@ function computeHexagram(code, listDate, today) {
   return { g: h.g, r: h.r, t: h.t, idx, codeNum, days, digitSum, listDate: listDate || '', today: today || '' };
 }
 
+// 易经趋势图形标注：多→红色上升折线 / 空→绿色下降折线 / 观→灰色平线（娱乐标注，非投资建议）
+function hexTrendSvg(t) {
+  const color = t === '多' ? '#ef4444' : t === '空' ? '#22c55e' : '#8b93ab';
+  const label = t === '多' ? '偏多' : t === '空' ? '偏空' : '中性观望';
+  const pts = t === '多' ? 'M3,13 L12,8 L21,10 L31,3'
+    : t === '空' ? 'M3,3 L12,8 L21,6 L31,13'
+    : 'M3,8.5 L14,8.5 L22,8 L31,8.5';
+  const endY = t === '多' ? 3 : t === '空' ? 13 : 8.5;
+  return `<svg class="hex-trend" width="35" height="17" viewBox="0 0 35 17" fill="none" aria-label="${label}">` +
+    `<polyline points="${pts}" stroke="${color}" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>` +
+    `<circle cx="31" cy="${endY}" r="3" fill="${color}"/></svg>`;
+}
+
+// 梅花易数体用关系趋势徽章（纯 HTML/CSS，绝对可靠）：大箭头 + 方向词 + 颜色背景
+function meihuaTrendSvg(relType) {
+  const cfg = ({
+    '用生体': { color: '#ef4444', bg: 'rgba(239,68,68,0.16)',  border: 'rgba(239,68,68,0.45)',  arrow: '↗', text: '顺势' },
+    '体克用': { color: '#f59e0b', bg: 'rgba(245,158,11,0.16)', border: 'rgba(245,158,11,0.45)', arrow: '↗', text: '审时' },
+    '比和':   { color: '#8b93ab', bg: 'rgba(139,147,171,0.16)',border: 'rgba(139,147,171,0.45)',arrow: '→', text: '守静' },
+    '体生用': { color: '#22c55e', bg: 'rgba(34,197,94,0.16)',  border: 'rgba(34,197,94,0.45)',  arrow: '↘', text: '蓄力' },
+    '用克体': { color: '#16a34a', bg: 'rgba(22,163,74,0.16)',  border: 'rgba(22,163,74,0.45)',  arrow: '↘', text: '避让' },
+    '平':     { color: '#8b93ab', bg: 'rgba(139,147,171,0.16)',border: 'rgba(139,147,171,0.45)',arrow: '→', text: '中性' },
+  })[relType] || { color: '#8b93ab', bg: 'rgba(139,147,171,0.16)', border: 'rgba(139,147,171,0.45)', arrow: '→', text: relType || '中性' };
+  return `<span class="mh-trend-badge" style="background:${cfg.bg};border-color:${cfg.border};color:${cfg.color}">` +
+    `<span class="mh-trend-arrow">${cfg.arrow}</span>` +
+    `<span class="mh-trend-text">${cfg.text}</span></span>`;
+}
+
 // 卜卦解析弹窗：逐步说明「卦象结果如何得到」（确定性演算，仅供娱乐）
 function openHexModal(code, listDate) {
   const hexModal = document.getElementById('hexModal');
@@ -434,7 +495,7 @@ function openHexModal(code, listDate) {
       <li><b>三者相加后对 64 取余</b>：(<code>${h.codeNum}</code> ＋ <code>${h.days}</code> ＋ <code>${h.digitSum}</code>) mod 64 ＝ <code>${h.idx}</code></li>
       <li><b>对应《易经》六十四卦</b>：序号 <code>${h.idx}</code> → 第 <code>${h.idx + 1}</code> 卦 → <b>${h.g}卦</b></li>
     </ol>
-    <div class="hex-result"><span class="hex-result-g">${h.g}卦</span><span class="hex-tag-t ${h.t === '多' ? 'hex-t-up' : h.t === '空' ? 'hex-t-down' : 'hex-t-mid'}">${h.t === '多' ? '偏多 📈' : h.t === '空' ? '偏空 📉' : '中性观望 ⚖️'}</span><span class="hex-result-r">${h.r}</span></div>
+    <div class="hex-result"><span class="hex-result-g">${hexTrendSvg(h.t)} ${h.g}卦</span><span class="hex-tag-t ${h.t === '多' ? 'hex-t-up' : h.t === '空' ? 'hex-t-down' : 'hex-t-mid'}">${HEX_TREND_TXT[h.t].label}</span><div class="hex-trend-txt"><b>${HEX_TREND_TXT[h.t].txt}</b> · ${HEX_TREND_TXT[h.t].action}</div><span class="hex-result-r">${h.r}</span></div>
     <p class="hex-note">以上「偏多/偏空/观望」仅为把六十四卦原始卦义<b>借喻到股市情绪与趋势的娱乐化映射</b>，与真实行情无因果关系，<b>绝不构成任何买卖建议</b>。</p>
   `;
   hexModal.classList.add('active');
@@ -561,7 +622,7 @@ const minStrengthVal = document.getElementById('minStrengthVal');
 const viewBtns = document.querySelectorAll('.view-btn');
 let currentView = 'list';
 const sortSelect = document.getElementById('sortSelect');
-let currentSort = 'signal';
+let currentSort = 'score-desc';
 const snapshotBarEl = document.getElementById('snapshotBar');
 const snapRefreshBtn = document.getElementById('snapRefreshBtn');
 const snapFlowChipEl = document.getElementById('snapFlowChip');
@@ -741,10 +802,34 @@ function init() {
       if (t === 'favorite') {
         if (activeTab === 'favorite') return;
         if (activeTab === 'position') exitPositionView();
+        if (activeTab === 'review') exitReviewView();
+        if (activeTab === 'stats') exitStatsView();
         typeTabs.forEach(x => x.classList.remove('active'));
         btn.classList.add('active');
         if (snapshotBarEl) snapshotBarEl.style.display = 'none';
         enterFavoriteView();
+        return;
+      }
+      if (t === 'review') {
+        if (activeTab === 'review') return;
+        if (activeTab === 'position') exitPositionView();
+        if (activeTab === 'favorite') exitFavoriteView();
+        if (activeTab === 'stats') exitStatsView();
+        typeTabs.forEach(x => x.classList.remove('active'));
+        btn.classList.add('active');
+        if (snapshotBarEl) snapshotBarEl.style.display = 'none';
+        enterReviewView();
+        return;
+      }
+      if (t === 'stats') {
+        if (activeTab === 'stats') return;
+        if (activeTab === 'position') exitPositionView();
+        if (activeTab === 'favorite') exitFavoriteView();
+        if (activeTab === 'review') exitReviewView();
+        typeTabs.forEach(x => x.classList.remove('active'));
+        btn.classList.add('active');
+        if (snapshotBarEl) snapshotBarEl.style.display = 'none';
+        enterStatsView();
         return;
       }
       if (activeTab === t) return;
@@ -776,9 +861,50 @@ function init() {
     try { localStorage.setItem('sg_flowOnlyIn', flowOnlyIn ? '1' : '0'); } catch (e) {}
     renderResults();
   });
+  // 技术推荐筛选：入(BUY) / 出(SELL)
+  const snapTechChips = document.querySelectorAll('.snap-chip[data-tech]');
+  snapTechChips.forEach(c => c.addEventListener('click', () => {
+    snapTechChips.forEach(x => x.classList.remove('active'));
+    c.classList.add('active');
+    currentTechFilter = c.dataset.tech;
+    renderResults();
+  }));
+  // 易经推荐筛选：入(卦多) / 出(卦空)
+  const snapHexChips = document.querySelectorAll('.snap-chip[data-hex]');
+  snapHexChips.forEach(c => c.addEventListener('click', () => {
+    snapHexChips.forEach(x => x.classList.remove('active'));
+    c.classList.add('active');
+    currentHexFilter = c.dataset.hex;
+    renderResults();
+  }));
 
   // 持仓 / 模拟交易 / 微信提醒 模块
   initPositionModule();
+
+  // 梅花易数：全局生辰（仅输入一次，localStorage 持久化），筛选出的股票自动结合八字起卦
+  const globalBirthEl = document.getElementById('globalBirth');
+  if (globalBirthEl) {
+    if (globalBirth) globalBirthEl.value = globalBirth;
+    globalBirthEl.addEventListener('change', () => {
+      globalBirth = globalBirthEl.value || '';
+      try { globalBirth ? localStorage.setItem('sg_meihua_birth', globalBirth) : localStorage.removeItem('sg_meihua_birth'); } catch (e) {}
+      meihuaCache.clear();        // 生辰变了，卦象缓存失效
+      renderResults();            // 重新渲染卡片/列表的运势标签
+    });
+  }
+  // 历法：统一按「农历」生辰八字（纯娱乐），无需用户选择
+  // 评分说明弹窗
+  const scoreHelpBtn = document.getElementById('scoreHelpBtn');
+  const scoreHelpModal = document.getElementById('scoreHelpModal');
+  const scoreHelpCloseBtn = document.getElementById('scoreHelpCloseBtn');
+  if (scoreHelpBtn && scoreHelpModal) scoreHelpBtn.addEventListener('click', () => { scoreHelpModal.style.display = 'flex'; });
+  if (scoreHelpCloseBtn && scoreHelpModal) scoreHelpCloseBtn.addEventListener('click', () => { scoreHelpModal.style.display = 'none'; });
+  if (scoreHelpModal) scoreHelpModal.addEventListener('click', (e) => { if (e.target === scoreHelpModal) scoreHelpModal.style.display = 'none'; });
+  // 加载手动注入的时事/事件（供相关新闻与梅花易数起卦使用）
+  loadManualEventsClient();
+
+  // 默认按综合分从高到低排序
+  if (sortSelect) sortSelect.value = 'score-desc';
 
   // 启动即拉取尾盘快照（A股 标签）
   loadSnapshot();
@@ -789,11 +915,18 @@ function switchType(type) {
   currentType = type;
   activeTab = type;
   if (favoriteSection) favoriteSection.style.display = 'none';
+  const revSec = document.getElementById('reviewSection'); if (revSec) revSec.style.display = 'none';
+  const stSec = document.getElementById('statsSection'); if (stSec) stSec.style.display = 'none';
   if (snapshotBarEl) snapshotBarEl.style.display = 'block';
   // 复位板块筛选 chips 与「仅看主力净流入」
   currentBoardFilter = 'all';
   document.querySelectorAll('.snap-chip[data-board]').forEach(c => c.classList.toggle('active', c.dataset.board === 'all'));
   if (snapFlowChipEl) snapFlowChipEl.classList.toggle('active', flowOnlyIn);
+  // 复位技术/易经推荐筛选
+  currentTechFilter = 'all';
+  currentHexFilter = 'all';
+  document.querySelectorAll('.snap-chip[data-tech]').forEach(c => c.classList.toggle('active', c.dataset.tech === 'all'));
+  document.querySelectorAll('.snap-chip[data-hex]').forEach(c => c.classList.toggle('active', c.dataset.hex === 'all'));
   boardFilter.value = 'all';
   // 切页前先作废旧的后台扫描会话（标 aborted + 置空），防止串台与资源占用，并复位进度条 UI
   if (scanSession) {
@@ -826,13 +959,156 @@ function switchType(type) {
   emptyState.querySelector('p').textContent = '正在加载尾盘快照…';
   const eh = emptyState.querySelector('.empty-hint'); if (eh) eh.style.display = 'none';
   updateStats();
-  // 市场范围筛选仅 A股 显示（可转债/ETF 无板块概念）
-  boardGroup.style.display = type === 'stock' ? 'block' : 'none';
-  // 板块筛选 chips 仅 A股 显示
+  // 市场范围筛选仅 A股/前兆 显示（可转债/ETF 无板块概念）
+  boardGroup.style.display = (type === 'stock' || type === 'precursor') ? 'block' : 'none';
+  // 板块筛选 chips 仅 A股/前兆 显示
   const snapFiltersEl = document.getElementById('snapFilters');
-  if (snapFiltersEl) snapFiltersEl.style.display = (type === 'stock') ? 'flex' : 'none';
+  if (snapFiltersEl) snapFiltersEl.style.display = (type === 'stock' || type === 'precursor') ? 'flex' : 'none';
   // 云端尾盘快照：按品种直接拉取对应快照浏览（不再由浏览器端扫描）
   loadSnapshot(type);
+}
+
+// ============ 梅花易数（娱乐参考，不计入综合评分） ============
+const MEIHUA_BAGUA = ['坤', '艮', '坎', '巽', '震', '离', '兑', '乾']; // idx = 二进制(初,二,三) 0..7
+const MEIHUA_WUXING = { 乾: '金', 兑: '金', 坎: '水', 震: '木', 巽: '木', 离: '火', 坤: '土', 艮: '土' };
+const MEIHUA_HEX = [
+  '坤', '剥', '比', '观', '豫', '晋', '萃', '否',
+  '谦', '艮', '蹇', '渐', '小过', '旅', '咸', '遁',
+  '师', '蒙', '坎', '涣', '解', '未济', '困', '讼',
+  '升', '蛊', '井', '巽', '恒', '鼎', '大过', '大有',
+  '复', '颐', '屯', '益', '震', '噬嗑', '随', '无妄',
+  '明夷', '贲', '既济', '家人', '丰', '离', '革', '同人',
+  '临', '损', '节', '中孚', '归妹', '睽', '兑', '履',
+  '泰', '大畜', '需', '小畜', '大壮', '大有', '夬', '乾',
+];
+const HEX_BY_NAME = {}; HEXAGRAMS.forEach(h => { HEX_BY_NAME[h.g] = h.r; });
+const SHENG = { 金: '水', 水: '木', 木: '火', 火: '土', 土: '金' }; // 我生
+const KE = { 金: '木', 木: '土', 土: '水', 水: '火', 火: '金' };       // 我克
+function mhDigits(s) { return String(s || '').replace(/\D/g, '').split('').reduce((a, c) => a + (+c || 0), 0); }
+function mhGuaBits(idx) { return [(idx >> 2) & 1, (idx >> 1) & 1, idx & 1]; }
+function mhBitsGua(b) { return (b[0] << 2) | (b[1] << 1) | b[2]; }
+function mhFlip(bit, k) { const nb = bit.slice(); nb[k] ^= 1; return nb; }
+function mhWuxing(idx) { return MEIHUA_WUXING[MEIHUA_BAGUA[idx]]; }
+function mhRelation(ti, yong) {
+  if (ti === yong) return { type: '比和', hint: '体用比和，内外相安。宜守静待时，顺其自然，观其变而后动。' };
+  if (SHENG[yong] === ti) return { type: '用生体', hint: '用（外在时机）生体（我），外力相济，如春水托舟。宜顺势而为，然不可执迷。' };
+  if (SHENG[ti] === yong) return { type: '体生用', hint: '体（我）生用（外在），我力外耗，如灯燃油尽。宜蓄力，勿妄动。' };
+  if (KE[yong] === ti) return { type: '用克体', hint: '用（外在）克体（我），外界相逼。宜避让守拙，勿强争。' };
+  if (KE[ti] === yong) return { type: '体克用', hint: '体（我）克用（外在），我主其事。可图可为，然须审时度势。' };
+  return { type: '平', hint: '' };
+}
+// 按数起卦：生辰 + 当下时机 + 代码 + 事件，得本卦/变卦/体用（纯计算，娱乐）
+function computeMeihua(birth, code, eventText) {
+  const m = String(birth || '').match(/(\d{4})-(\d{1,2})-(\d{1,2})T?(\d{1,2})?/);
+  let y = 1990, mo = 1, d = 1, h = 8;
+  if (m) { y = +m[1]; mo = +m[2]; d = +m[3]; h = m[4] ? +m[4] : 8; }
+  const now = new Date();
+  const ny = now.getFullYear(), nmo = now.getMonth() + 1, nd = now.getDate(), nh = now.getHours();
+  const up = (y + mo + d + ny + nmo + nd) % 8;           // 上卦（外）
+  const down = (up + nh + mhDigits(code)) % 8;            // 下卦（内）
+  const yao = (((up + down + mhDigits(birth) + mhDigits(eventText)) % 6) + 6) % 6 + 1; // 动爻 1..6
+  let newUp = up, newDown = down;
+  if (yao <= 3) newDown = mhBitsGua(mhFlip(mhGuaBits(down), yao - 1));
+  else newUp = mhBitsGua(mhFlip(mhGuaBits(up), yao - 4));
+  const benIdx = up * 8 + down, bianIdx = newUp * 8 + newDown;
+  const tiIdx = yao <= 3 ? up : down;     // 体（静卦）
+  const yongIdx = yao <= 3 ? down : up;  // 用（动卦）
+  const tiW = mhWuxing(tiIdx), yongW = mhWuxing(yongIdx);
+  const rel = mhRelation(tiW, yongW);
+  const yaoNames = ['', '初', '二', '三', '四', '五', '上'];
+  return {
+    benName: MEIHUA_HEX[benIdx], benCi: HEX_BY_NAME[MEIHUA_HEX[benIdx]] || '',
+    bianName: MEIHUA_HEX[bianIdx], bianCi: HEX_BY_NAME[MEIHUA_HEX[bianIdx]] || '',
+    yao, yaoName: yaoNames[yao], tiName: MEIHUA_BAGUA[tiIdx], tiW, yongName: MEIHUA_BAGUA[yongIdx], yongW, rel,
+  };
+}
+function renderMeihua(o) {
+  if (!o) return '<div class="mh-empty">请先填写生辰时间后起卦。</div>';
+  return `
+    <div class="mh-gua">
+      <div class="mh-gua-card">
+        <div class="mh-gua-title">本卦</div>
+        <div class="mh-gua-name">${o.benName}</div>
+        <div class="mh-gua-ci">${o.benCi}</div>
+      </div>
+      <div class="mh-yao">动爻：第 ${o.yaoName} 爻</div>
+      <div class="mh-gua-card">
+        <div class="mh-gua-title">变卦</div>
+        <div class="mh-gua-name">${o.bianName}</div>
+        <div class="mh-gua-ci">${o.bianCi}</div>
+      </div>
+    </div>
+    <div class="mh-tiyong">
+      <div class="mh-ty-row"><span class="mh-ty-label">体（我）</span><b>${o.tiName}卦 · ${o.tiW}</b></div>
+      <div class="mh-ty-row"><span class="mh-ty-label">用（所问之事·时机）</span><b>${o.yongName}卦 · ${o.yongW}</b></div>
+      <div class="mh-rel ${o.rel.type === '用克体' || o.rel.type === '体生用' ? 'mh-rel-bad' : 'mh-rel-good'}">${meihuaTrendSvg(o.rel.type)}<span class="mh-rel-text">体用关系：<b>${o.rel.type}</b> —— ${o.rel.hint}<br/><span class="mh-trend-txt"><b>${MEIHUA_TREND_TXT[o.rel.type] ? MEIHUA_TREND_TXT[o.rel.type].txt : ''}</b>${MEIHUA_TREND_TXT[o.rel.type] ? ' · ' + MEIHUA_TREND_TXT[o.rel.type].action : ''}</span></span></div>
+    </div>
+    <div class="mh-jie">☯ 解卦提示：以上为梅花易数按数起卦之象，卦辞诗词仅为固定暗示。<b>体为你（我），用为所问之股与当下时机</b>，体用生克与卦象意象，请君自解。市场由千千万万「我」汇聚成势，不遵从任一人的意志——此象仅供娱乐，<b>切勿据此买卖</b>。</div>
+  `;
+}
+// 前端加载 手动事件(manual_events.json) + 自动抓取的新闻缓存(news_cache.json)
+async function loadManualEventsClient() {
+  try {
+    const r = await fetch(`./manual_events.json?t=${Date.now()}`);
+    if (r.ok) { const d = await r.json(); manualEventsCache = Array.isArray(d) ? d : []; }
+  } catch (e) { manualEventsCache = []; }
+  try {
+    const r = await fetch(`./news_cache.json?t=${Date.now()}`);
+    if (r.ok) { const d = await r.json(); autoNewsCache = Array.isArray(d) ? d : []; }
+  } catch (e) { autoNewsCache = []; }
+}
+
+// 取该股票相关的时事/事件（去重）：自身命中的事件 + 自动抓取新闻 + 手动注入事件
+function stockNews(r) {
+  const out = [];
+  const seen = new Set();
+  const push = (text, dir, from) => {
+    if (!text || seen.has(text)) return;
+    seen.add(text);
+    out.push({ text, dir: dir || 'pos', from: from || '事件' });
+  };
+  // 若新闻明确提及其他个股代码（6位），则不再按行业泛化匹配给当前股票；
+  // 文本里同时包含当前代码则保留（同一条新闻涉及多只个股时共享）
+  const selfCode = (r.code || '').replace(/^(sh|sz|bj)/, '');
+  const mentionsOtherStock = (text) => {
+    const codes = (String(text).match(/\b\d{6}\b/g) || []);
+    if (codes.length === 0) return false;
+    return !codes.includes(selfCode);
+  };
+  if (r.eventBoost && r.eventBoost.event) push(r.eventBoost.event, r.eventBoost.direction, '命中事件');
+  const secs = (r.sector || []);
+  for (const m of autoNewsCache) {
+    if (mentionsOtherStock(m.event)) continue;
+    if ((m.sectors || []).some(s => secs.includes(s))) push(m.event, m.direction, '自动抓取');
+  }
+  for (const m of manualEventsCache) {
+    if (mentionsOtherStock(m.event)) continue;
+    if ((m.sectors || []).some(s => secs.includes(s))) push(m.event, m.direction, '手动注入');
+  }
+  return out;
+}
+function stockEventText(r) { return stockNews(r).map(n => n.text).join('；'); }
+
+// 梅花易数：用全局生辰 + 代码 + 当前事件文本，自动给每只票起卦（仅娱乐）
+function meihuaForStock(r) {
+  if (!globalBirth) return null;
+  const ev = stockEventText(r);
+  const key = globalBirth + '|' + r.code + '|' + ev;
+  if (!meihuaCache.has(key)) meihuaCache.set(key, computeMeihua(globalBirth, r.code, ev));
+  return meihuaCache.get(key);
+}
+
+// 梅花易数完整渲染 + 「时事与卦象联系」说明（点进个股详情时展示）
+function renderMeihuaFull(o, news, name) {
+  const base = renderMeihua(o);
+  const newsHtml = news && news.length
+    ? `<div class="mh-news">
+         <div class="mh-news-title">📰 时事与卦象联系（${name || ''}）</div>
+         ${news.map(n => `<div class="mh-news-item"><span class="news-tag ${n.dir === 'pos' ? 'news-pos' : 'news-neg'}">${n.from}</span> ${n.text}</div>`).join('')}
+         <div class="mh-news-hint">「用」为所问之股与当下时机，上述时事即「用」之象；「体」为你（我）。请观卦象意象与上述消息之呼应，<b>自解其意</b>。市场由千千万万「我」汇聚成势，不遵从任一人的意志。</div>
+       </div>`
+    : `<div class="mh-news mh-news-empty">暂无关联时事（可到 manual_events.json 注入行业事件）。</div>`;
+  return base + newsHtml;
 }
 
 // ============ 股票池管理 ============
@@ -1121,6 +1397,8 @@ async function loadSnapshot(type = currentType) {
     const snap = await res.json();
     currentSnapshotMeta = snap;
     scanResults = Array.isArray(snap.stocks) ? snap.stocks : [];
+    // 计算综合分前十集合（用于高亮），按 score 降序取前 10
+    topTenSet = new Set([...scanResults].filter(r => typeof r.score === 'number').sort((a, b) => b.score - a.score).slice(0, 10).map(r => r.code));
     lastScanRecentDays = snap.recentDays || 5;
     updateStats();
     if (!scanResults.length) {
@@ -1181,14 +1459,18 @@ function renderSnapshotBar(snap) {
     meta.innerHTML = '<span class="snap-warn">暂无快照数据</span>';
     return;
   }
-  const typeName = { stock: 'A股', cb: '可转债', etf: 'ETF' }[currentType] || 'A股';
+  const typeName = { stock: 'A股', cb: '可转债', etf: 'ETF', precursor: '前兆' }[currentType] || 'A股';
   const updated = snap.updatedAt ? new Date(snap.updatedAt).toLocaleString('zh-CN') : '-';
+  const precHint = currentType === 'precursor'
+    ? '<span class="snap-note prec">专抓「温和启动、尚未爆发」的低位转折票（均线纠缠+RSI回升+温和放量+未破布林上轨），风险低于已涨停的拐点 BUY。</span>'
+    : '';
   meta.innerHTML = `
     <span class="snap-type">${typeName} · 尾盘快照</span>
     <span>更新于 <b>${updated}</b></span>
     <span>交易日 <b>${snap.tradeDate || '-'}</b></span>
     <span>命中 <b class="snap-count">${snap.count != null ? snap.count : scanResults.length}</b> 只</span>
     <span>MA${snap.maPeriod || ''} · 近${snap.recentDays || ''}日拐点</span>
+    ${precHint}
     <span class="snap-note">${snap.note || ''}</span>
   `;
 }
@@ -1206,6 +1488,20 @@ function renderResults() {
   // 板块筛选（快照内按 board 细分：主板 / 创业板 / 科创板）
   if (currentBoardFilter !== 'all') {
     filtered = filtered.filter(r => r.board === currentBoardFilter);
+  }
+
+  // 技术推荐筛选：入=BUY / 出=SELL（含前兆 BUY 与拐点 BUY/SELL）
+  if (currentTechFilter === 'buy') {
+    filtered = filtered.filter(r => r.recommendationType === 'BUY' || (r.latestSignal && r.latestSignal.type === 'BUY'));
+  } else if (currentTechFilter === 'sell') {
+    filtered = filtered.filter(r => r.recommendationType === 'SELL' || (r.latestSignal && r.latestSignal.type === 'SELL'));
+  }
+
+  // 易经推荐筛选：入=卦多 / 出=卦空（观/观望 不属入也不属出）
+  if (currentHexFilter === 'in') {
+    filtered = filtered.filter(r => r.hexagram && r.hexagram.t === '多');
+  } else if (currentHexFilter === 'out') {
+    filtered = filtered.filter(r => r.hexagram && r.hexagram.t === '空');
   }
 
   // 仅看主力净流入的标的
@@ -1246,7 +1542,11 @@ function renderResults() {
     // 「只看主力净流入」却为 0：区分「数据在浏览器端取不到」与「确实无此类标的」
     let emptyMsg = '暂无符合条件的股票';
     let emptySub = '';
-    if (flowOnlyIn && scanResults.length > 0) {
+    if (currentType === 'precursor') {
+      emptyMsg = '🚀 今日没有符合「前兆」条件的票';
+      emptySub = '前兆扫描专抓「温和启动、尚未爆发」的低位转折票，条件较严格（均线纠缠 + RSI 回升 35~60 + 量比 1.5~4 + 当日涨 1~5% + 布林未破上轨 + KDJ金叉/MACD转强）。' +
+        '当天同时满足的票较少属正常现象——它是低频高质筛选器，宁可空着也不乱推。若连续多日为空，可在 scanner.js 的 <code>detectPrecursor</code> 放宽阈值。';
+    } else if (flowOnlyIn && scanResults.length > 0) {
       const anyFlowNum = scanResults.some(r => typeof r.flow === 'number');
       if (!anyFlowNum) {
         emptyMsg = '勾选「只看主力净流入」后没有结果';
@@ -1321,7 +1621,7 @@ function updateScanRangeHint() {
   }
 }
 
-// 排序：按信号日期 / 曲率强度 / 默认（信号优先）
+// 排序：按信号日期 / 曲率强度 / 默认（信号优先）/ 综合分
 function sortResults(list) {
   const arr = [...list];
   if (currentSort === 'date-desc') {
@@ -1354,6 +1654,9 @@ function sortResults(list) {
     arr.sort((a, b) => (b.changePct || 0) - (a.changePct || 0));
   } else if (currentSort === 'change-asc') {
     arr.sort((a, b) => (a.changePct || 0) - (b.changePct || 0));
+  } else if (currentSort === 'score-desc') {
+    // 综合分从高到低
+    arr.sort((a, b) => (b.score || 0) - (a.score || 0));
   } else {
     // 默认：有信号排前面，买入优先，再按信号日期倒序
     arr.sort((a, b) => {
@@ -1386,6 +1689,14 @@ function boardLabel(board) {
   return { main: '主板', cyb: '创业板', kcb: '科创板', cb: '可转债', etf: 'ETF' }[board] || board;
 }
 
+// 涨停/大涨风险档位色标（🟢低险可追 / 🟡中险关注 / 🔴高险追高）
+function riskBadgeHtml(r) {
+  if (!r.limitUpTier) return '';
+  const map = { low: 'lu-low', mid: 'lu-mid', high: 'lu-high' };
+  const txt = { low: '🟢低险', mid: '🟡中险', high: '🔴高险' };
+  return `<span class="risk-badge ${map[r.limitUpTier]}" title="${r.limitUpReason || ''}">${txt[r.limitUpTier]}</span>`;
+}
+
 // 卡片视图
 function renderResultsCards(filtered) {
   resultCards.className = 'result-cards';
@@ -1394,6 +1705,8 @@ function renderResultsCards(filtered) {
     const signalBadge = signal
       ? `<span class="signal-badge ${signal.type.toLowerCase()}">${signal.type === 'BUY' ? '入场' : '出场'}</span>`
       : `<span class="signal-badge none">无信号</span>`;
+    const isTop = topTenSet.has(r.code);
+    const mh = meihuaForStock(r); // 梅花易数：全局生辰 + 代码 + 事件（无生辰则为 null）
 
     const trendClass = r.trend === 'UP' ? 'trend-up' : r.trend === 'DOWN' ? 'trend-down' : 'trend-flat';
     const trendIcon = r.trend === 'UP' ? '↑' : r.trend === 'DOWN' ? '↓' : '→';
@@ -1414,17 +1727,28 @@ function renderResultsCards(filtered) {
       ? `<div class="rc-item"><span class="label">主力净流入</span><span class="value ${r.flow >= 0 ? 'flow-in' : 'flow-out'}">${fmtMoney(r.flow)}</span></div>`
       : '';
 
+    const scoreHtml = (typeof r.score === 'number')
+      ? `<div class="rc-item"><span class="label">综合分</span><span class="value score-val">${r.score.toFixed(1)}</span></div>`
+      : '';
+
+    const eventHtml = r.eventBoost
+      ? `<div class="rc-item"><span class="label">事件</span><span class="value event-boost">${r.eventBoost.direction === 'pos' ? '▲' : '▼'} ${String(r.eventBoost.event).slice(0, 12)}</span></div>`
+      : '';
+
     return `
-      <div class="result-card">
+      <div class="result-card${isTop ? ' top10' : ''}">
         <div class="rc-top">
           <div class="rc-name">
             <span class="rc-code">${r.code}</span>
             <strong class="rc-title">${r.name}</strong>
             <span class="board-badge ${r.board}">${boardLabel(r.board)}</span>
-            ${r.hexagram ? `<span class="hex-tag clickable" title="点击查看卦象如何得出" onclick="openHexModal('${r.code}','${r.hexagram.listDate}')">📿 ${r.hexagram.g}卦</span>` : ''}
+            ${mh ? `<span class="hex-tag clickable" title="${escapeHtml((MEIHUA_TREND_TXT[mh.rel.type] || {}).txt || '梅花易数运势卦象')}：${escapeHtml((MEIHUA_TREND_TXT[mh.rel.type] || {}).action || '' )}" onclick="showChart('${r.code}')">📿 ${meihuaTrendSvg(mh.rel.type)} ${mh.benName}卦</span>` : (r.hexagram ? `<span class="hex-tag clickable" title="${escapeHtml(HEX_TREND_TXT[r.hexagram.t].txt)}：${escapeHtml(HEX_TREND_TXT[r.hexagram.t].action)}" onclick="openHexModal('${r.code}','${r.hexagram.listDate}')">📿 ${hexTrendSvg(r.hexagram.t)} ${r.hexagram.g}卦</span>` : '')}
+            ${isTop ? '<span class="top10-badge">🏆 TOP10</span>' : ''}
           </div>
           <div class="rc-top-right">
+            ${(typeof r.score === 'number') ? `<span class="score-badge ${r.score >= 70 ? 'score-high' : r.score < 50 ? 'score-low' : ''}" title="综合评分：${r.score.toFixed(1)}">${r.score.toFixed(1)}</span>` : ''}
             ${signalBadge}
+            ${riskBadgeHtml(r)}
             <button class="btn-fav-card ${isFav(r.code) ? 'on' : ''}" data-fav="${r.code}" onclick="window.toggleFav('${r.code}','${r.name}')" title="收藏观察">${isFav(r.code) ? '⭐' : '☆'}</button>
           </div>
         </div>
@@ -1451,6 +1775,9 @@ function renderResultsCards(filtered) {
           </div>
           ${strengthHtml}
           ${flowHtml}
+          ${scoreHtml}
+          ${eventHtml}
+          ${r.isPrecursor && r.precursorReason ? `<div class="rc-item full"><span class="label">前兆逻辑</span><span class="value prec">${r.precursorReason}</span></div>` : ''}
         </div>
         <div class="rc-bottom">
           <span class="rc-rec ${recClass}" style="color:${recColor};">建议: ${r.recommendation}</span>
@@ -1470,6 +1797,8 @@ function renderResultsTable(filtered) {
     const badge = signal
       ? `<span class="signal-badge ${signal.type.toLowerCase()}">${signal.type === 'BUY' ? '进' : '出'}</span>`
       : `<span class="signal-badge none">—</span>`;
+    const isTop = topTenSet.has(r.code);
+    const mh = meihuaForStock(r);
     const derivClass = r.latestDerivative > 0 ? 'derivative-positive'
       : r.latestDerivative < 0 ? 'derivative-negative' : 'derivative-zero';
     const derivSign = r.latestDerivative > 0 ? '+' : '';
@@ -1481,18 +1810,19 @@ function renderResultsTable(filtered) {
       ? `<span class="td-sigdate">${signal.date}</span><span class="td-ago">${agoText(r.signalDaysAgo).replace(' · ', '')}</span>`
       : '—';
     return `
-      <tr>
-        <td class="td-name"><strong>${r.name}</strong><span class="td-code">${r.code}</span> <span class="board-badge sm ${r.board}">${boardLabel(r.board)}</span></td>
+      <tr class="${isTop ? 'top10' : ''}">
+        <td class="td-name"><strong>${r.name}</strong><span class="td-code">${r.code}</span> <span class="board-badge sm ${r.board}">${boardLabel(r.board)}</span>${isTop ? ' <span class="top10-badge sm">TOP10</span>' : ''}</td>
         <td style="color:${r.lastClose > 0 ? '#ef4444' : '#22c55e'};">¥${r.lastClose.toFixed(2)}</td>
         <td style="color:${r.changePct >= 0 ? '#ef4444' : '#22c55e'};white-space:nowrap;">${r.changePct >= 0 ? '+' : ''}${(r.changePct != null ? r.changePct : 0).toFixed(2)}%</td>
         <td>${r.latestMa !== null ? '¥' + r.latestMa.toFixed(2) : '-'}</td>
         <td class="${derivClass}">${derivSign}${r.latestDerivative !== null ? r.latestDerivative.toFixed(4) : '-'}</td>
         <td>${r.trendLabel}</td>
-        <td>${badge}</td>
+        <td>${badge}${riskBadgeHtml(r)}</td>
         <td class="sigdate-cell">${sigDate}</td>
         <td class="strength-cell">${strength}</td>
+        <td class="score-cell ${typeof r.score === 'number' ? (r.score >= 70 ? 'score-high' : r.score < 50 ? 'score-low' : '') : ''}">${typeof r.score === 'number' ? r.score.toFixed(1) : '—'}</td>
         <td class="${typeof r.flow === 'number' ? (r.flow >= 0 ? 'flow-in' : 'flow-out') : ''}">${typeof r.flow === 'number' ? fmtMoney(r.flow) : '—'}</td>
-        <td class="hex-cell clickable" ${r.hexagram ? `onclick="openHexModal('${r.code}','${r.hexagram.listDate}')" title="点击查看卦象如何得出"` : ''}>${r.hexagram ? r.hexagram.g + '卦' : '—'}</td>
+        <td class="hex-cell clickable" ${mh ? `onclick="showChart('${r.code}')" title="${escapeHtml((MEIHUA_TREND_TXT[mh.rel.type] || {}).txt || '梅花易数运势卦象')}：${escapeHtml((MEIHUA_TREND_TXT[mh.rel.type] || {}).action || '')}"` : (r.hexagram ? `onclick="openHexModal('${r.code}','${r.hexagram.listDate}')" title="${escapeHtml(HEX_TREND_TXT[r.hexagram.t].txt)}：${escapeHtml(HEX_TREND_TXT[r.hexagram.t].action)}"` : '')}>${mh ? meihuaTrendSvg(mh.rel.type) + ' ' + mh.benName + '卦' : (r.hexagram ? hexTrendSvg(r.hexagram.t) + ' ' + r.hexagram.g + '卦' : '—')}</td>
         <td style="color:${recColor};white-space:nowrap;">${r.recommendation}</td>
         <td><button class="btn-fav-sm ${isFav(r.code) ? 'on' : ''}" data-fav="${r.code}" onclick="window.toggleFav('${r.code}','${r.name}')" title="收藏观察">${isFav(r.code) ? '⭐' : '☆'}</button></td>
         <td><button class="btn-chart-sm" onclick="showChart('${r.code}')">K线</button></td>
@@ -1514,6 +1844,7 @@ function renderResultsTable(filtered) {
             <th>信号</th>
             <th>信号日期</th>
             <th>强度</th>
+            <th>综合分</th>
             <th>主力净流入</th>
             <th>运势</th>
             <th>建议</th>
@@ -1583,6 +1914,19 @@ async function showChart(code) {
       <span class="cp-warn">⚠️ 入场/出场指标仅表示「开始关注」的时点，不构成真实出入场建议；本工具用于筛选出现反转预兆的股票，投资有风险，请自行判断。</span>`;
   }
 
+  // 相关新闻/事件（该股票 sector 命中的 manual_events + 自身命中事件）
+  const newsEl = document.getElementById('chartNews');
+  if (newsEl) {
+    const news = stockNews(poolItem);
+    newsEl.innerHTML = news.length
+      ? `<b>📰 相关新闻/事件</b>：${news.map(n => `<span class="news-item ${n.dir === 'pos' ? 'news-pos' : n.dir === 'neg' ? 'news-neg' : 'news-neu'}"><span class="news-tag">${n.from}</span>${n.text}</span>`).join('')}<span class="news-warn">（自动抓取相关新闻 / 手动注入事件，行业关联匹配；仅供娱乐参考，非投资建议）</span>`
+      : `<b>📰 相关新闻/事件</b>：<span class="muted">暂无关联事件（news_fetcher.js 自动抓取或 manual_events.json 手动注入）</span>`;
+  }
+
+  // 综合评分拆解（评分如何来的 + 每个维度/子项分数为何）
+  const scoreEl = document.getElementById('chartScore');
+  if (scoreEl) scoreEl.innerHTML = renderScoreDetail(poolItem);
+
   try {
     const klineData = await fetchKlineClient(code, 150);
     if (seq !== chartSeq) return;
@@ -1615,10 +1959,17 @@ async function showChart(code) {
     renderSignalRecords(data.signals);
     // 同步交易栏持仓状态
     syncTradeBar();
-    // 易经八卦（娱乐标签）：上市时间 + 代码 + 当日日期
-    const hex = computeHexagram(code, data.chartData.dates[0], new Date().toISOString().slice(0, 10));
+    // 梅花易数（娱乐，不计入综合评分）：全局生辰 + 代码 + 当前事件，自动起卦 + 时事联系
     const hexEl = document.getElementById('chartHex');
-    if (hexEl) hexEl.innerHTML = `📿 <b>运势卦象</b>：<a href="javascript:;" class="hex-click" onclick="openHexModal('${code}','${hex.listDate}')">${hex.g}卦</a> <span class="hex-tag-t ${hex.t === '多' ? 'hex-t-up' : hex.t === '空' ? 'hex-t-down' : 'hex-t-mid'}">${hex.t === '多' ? '偏多 📈' : hex.t === '空' ? '偏空 📉' : '中性观望 ⚖️'}</span> · ${hex.r} <span class="hex-fun">（点击卦名看如何得出 · 仅供娱乐，不构成任何建议）</span>`;
+    if (hexEl) {
+      if (!globalBirth) {
+        hexEl.innerHTML = `📿 <b>梅花易数运势</b>：请先在右上角「<b>农历生辰</b>」填入<b>农历</b>出生时间（仅一次，年/月/日/时），筛选出的股票会自动结合你的八字起卦，点开任一股票即可见卦象与「时事联系」。此象仅供娱乐，<b>不计入综合评分</b>。`;
+      } else {
+        const mh = meihuaForStock(poolItem);
+        const news = stockNews(poolItem);
+        hexEl.innerHTML = `<div class="mh-detail">${renderMeihuaFull(mh, news, poolItem ? poolItem.name : code)}</div>`;
+      }
+    }
     // 资金流向（主力净流入）
     const flowEl = document.getElementById('chartFlow');
     if (flowEl) {
@@ -1633,6 +1984,55 @@ async function showChart(code) {
   } catch (err) {
     chartInfo.innerHTML = `<p style="color:#ef4444;">加载失败: ${err.message}</p>`;
   }
+}
+
+// 综合评分拆解：综合分 + 5 维度分数 + 每个子项的原始值与打分理由
+function renderScoreDetail(r) {
+  if (!r || typeof r.score !== 'number') return '<b>🧮 综合评分</b>：<span class="muted">本次无评分数据</span>';
+  const dimNames = { tech: '技术', fund: '资金', mood: '情绪', fundamental: '基本面', event: '事件' };
+  const dimColor = { tech: '#ef4444', fund: '#22c55e', mood: '#5b9bff', fundamental: '#f5b450', event: '#c9a0ff' };
+  const bd = r.scoreBreakdown || {};
+  const detail = r.scoreDetail || {};
+  let html = `<div class="cs-head"><b>🧮 综合评分拆解</b><span class="cs-total">${r.score.toFixed(1)}</span>`;
+  html += `<span class="cs-formula">技术45%·资金25%·情绪15%·基本面10%·事件5%</span></div>`;
+  html += '<div class="cs-dims">';
+  for (const dim of ['tech', 'fund', 'mood', 'fundamental', 'event']) {
+    const sc = bd[dim] != null ? bd[dim] : 50;
+    const w = (detail[dim] && detail[dim].weight != null) ? detail[dim].weight : null;
+    const isEvent = dim === 'event';
+    html += `<div class="cs-dim">`;
+    html += `<div class="cs-dim-top"><span class="cs-dim-name" style="color:${dimColor[dim]}">${dimNames[dim]}</span><span class="cs-dim-w">${w != null ? Math.round(w * 100) + '%' : ''}</span><span class="cs-dim-sc">${sc.toFixed(1)}</span></div>`;
+    html += `<div class="cs-bar"><div class="cs-bar-fill" style="width:${Math.max(2, sc)}%;background:${dimColor[dim]}"></div></div>`;
+    const subs = detail[dim] && detail[dim].subs;
+    html += '<div class="cs-subs">';
+    if (subs && subs.length) {
+      for (const s of subs) {
+        html += `<div class="cs-sub"><span class="cs-sub-name">${s.label}</span><span class="cs-sub-raw">${s.rawShow}</span><span class="cs-sub-sc">${s.sub}</span><div class="cs-sub-reason">${s.reason}</div></div>`;
+      }
+    } else if (isEvent) {
+      const hits = detail.event && detail.event.hits;
+      if (hits && hits.length) {
+        for (const h of hits) {
+          const dir = h.direction === 'pos' ? 'pos' : 'neg';
+          const dirLabel = dir === 'pos' ? '利好' : '利空';
+          const mult = h.strength > 1 ? `<span class="cs-event-mult">×${h.strength}</span>` : '';
+          const fullText = String(h.event || '');
+          const brief = fullText.replace(/^[【\[《]|[】\]》]$/g, '').slice(0, 22);
+          const trunc = brief.length >= 22 ? '…' : '';
+          html += `<div class="cs-event-item">
+            <div class="cs-event-head"><span class="cs-event-dir ${dir}">${dirLabel}</span>${mult}<span class="cs-event-brief">${escapeHtml(brief)}${trunc}</span></div>
+            <div class="cs-event-text">${escapeHtml(fullText)}</div>
+          </div>`;
+        }
+      } else {
+        html += '<div class="cs-sub"><div class="cs-sub-reason">未命中任何注入事件，按中性 50 计</div></div>';
+      }
+    }
+    html += '</div></div>';
+  }
+  html += '</div>';
+  html += '<div class="cs-warn">⚠️ 评分仅为量化因子演示，不构成投资建议；梅花易数运势不计入本评分。</div>';
+  return html;
 }
 
 // 切换信号指引虚线的显示/隐藏（记忆选择，立即重绘当前K线图）
@@ -1709,11 +2109,7 @@ function toggleMaLine(period) {
   if (lastChartData) renderKlineChart(lastChartData);
 }
 
-function renderKlineChart(data) {
-  lastChartData = data;
-  if (klineChartInstance) klineChartInstance.dispose();
-  klineChartInstance = echarts.init(document.getElementById('klineChart'));
-
+function buildKlineOption(data) {
   const cd = data.chartData;
   const showCount = Math.min(90, cd.dates.length);
   const startIdx = cd.dates.length - showCount;
@@ -1928,7 +2324,14 @@ function renderKlineChart(data) {
     ],
   };
 
-  klineChartInstance.setOption(option);
+  return option;
+}
+
+function renderKlineChart(data) {
+  lastChartData = data;
+  if (klineChartInstance) klineChartInstance.dispose();
+  klineChartInstance = echarts.init(document.getElementById('klineChart'));
+  klineChartInstance.setOption(buildKlineOption(data));
 }
 
 function renderDerivativeChart(data) {
@@ -2395,6 +2798,402 @@ function exitFavoriteView() {
   else { resultsSection.style.display = 'none'; emptyState.style.display = ''; }
   typeTabs.forEach(x => x.classList.toggle('active', x.dataset.type === currentType));
   activeTab = currentType;
+}
+
+// ============ 复盘视图 ============
+let reviewType = 'stock';
+let reviewLoaded = false;
+let currentReviewData = null;
+
+function fmtDate(d) {
+  const y = d.getFullYear(), m = String(d.getMonth() + 1).padStart(2, '0'), day = String(d.getDate()).padStart(2, '0');
+  return `${y}-${m}-${day}`;
+}
+
+function enterReviewView() {
+  activeTab = 'review';
+  resultsSection.style.display = 'none';
+  emptyState.style.display = 'none';
+  if (positionSection) positionSection.style.display = 'none';
+  if (favoriteSection) favoriteSection.style.display = 'none';
+  if (statsSection) statsSection.style.display = 'none';
+  const revSec = document.getElementById('reviewSection');
+  if (revSec) revSec.style.display = '';
+  // 默认入选日 = 昨天
+  const y = new Date(); y.setDate(y.getDate() - 1);
+  const revDateEl = document.getElementById('revDate');
+  if (revDateEl && !reviewLoaded) revDateEl.value = fmtDate(y);
+  bindReviewUI();
+}
+
+function exitReviewView() {
+  const revSec = document.getElementById('reviewSection');
+  if (revSec) revSec.style.display = 'none';
+  typeTabs.forEach(x => x.classList.toggle('active', x.dataset.type === currentType));
+  activeTab = currentType;
+}
+
+function bindReviewUI() {
+  const sec = document.getElementById('reviewSection');
+  if (!sec || sec._bound) return;
+  sec._bound = true;
+  sec.querySelectorAll('.rev-type-btn').forEach(b => b.addEventListener('click', () => {
+    sec.querySelectorAll('.rev-type-btn').forEach(x => x.classList.remove('active'));
+    b.classList.add('active');
+    reviewType = b.dataset.rt;
+    loadReview();
+  }));
+  const prevBtn = document.getElementById('revPrevBtn');
+  if (prevBtn) prevBtn.onclick = () => {
+    const el = document.getElementById('revDate');
+    const d = el.value ? new Date(el.value) : new Date();
+    d.setDate(d.getDate() - 1);
+    el.value = fmtDate(d);
+    loadReview();
+  };
+  const loadBtn = document.getElementById('revLoadBtn');
+  if (loadBtn) loadBtn.onclick = () => loadReview();
+  const sortSel = document.getElementById('revSort');
+  if (sortSel) sortSel.onchange = () => { if (currentReviewData) renderReview(currentReviewData); };
+
+  // 复盘行：点股票名打开 K线 弹窗
+  const listEl = document.getElementById('revList');
+  if (listEl && !listEl._klineBound) {
+    listEl._klineBound = true;
+    listEl.addEventListener('click', (e) => {
+      const link = e.target.closest('.rev-name-link');
+      if (link) openReviewKline(link.dataset.code, link.dataset.name);
+    });
+  }
+  const closeBtn = document.getElementById('revKlineClose');
+  if (closeBtn) closeBtn.onclick = closeReviewKline;
+  if (revKlineModal) revKlineModal.addEventListener('click', (e) => { if (e.target === revKlineModal) closeReviewKline(); });
+  window.addEventListener('resize', () => { if (revKlineInstance) revKlineInstance.resize(); });
+
+  // 复盘子 tab 切换：复盘列表 / 经验总结
+  const revTabs = document.querySelectorAll('#revTabs .rev-tab');
+  revTabs.forEach(t => t.addEventListener('click', () => {
+    revTabs.forEach(x => x.classList.remove('active'));
+    t.classList.add('active');
+    const tab = t.dataset.rtab;
+    document.getElementById('reviewPane').style.display = tab === 'review' ? '' : 'none';
+    document.getElementById('expPane').style.display = tab === 'exp' ? '' : 'none';
+    if (tab === 'exp') loadExperience();
+  }));
+  // 经验总结内"返回复盘列表"按钮
+  const expClose = document.getElementById('expCloseBtn');
+  if (expClose) expClose.onclick = () => {
+    revTabs.forEach(x => x.classList.toggle('active', x.dataset.rtab === 'review'));
+    document.getElementById('reviewPane').style.display = '';
+    document.getElementById('expPane').style.display = 'none';
+  };
+}
+
+let experienceData = null;
+// 因子分析渲染（经验总结页 & 参数统计页共用）：成功共同特征 / 失误共同原因 / 卦象维度
+function renderFactorAnalysis(fa, el) {
+  if (!el) return;
+  if (!fa) { el.innerHTML = '<div class="ef-empty">因子分析数据待下次扫描生成（每日滚动累加）。</div>'; return; }
+  const fmt = f => `<div class="ef-item">
+    <span class="ef-key">${f.name}「${f.group}」</span>
+    <span class="ef-n">n=${f.n}</span>
+    <span class="ef-rate">成功${f.upRate}% <i>/</i> 失败${f.downRate}%</span>
+    <span class="ef-win ${f.winRate >= 55 ? 'up' : f.winRate <= 45 ? 'down' : ''}">胜率${f.winRate}%</span>
+  </div>`;
+  const hexRow = (t, lab) => fa.hexT && fa.hexT[t]
+    ? `<span class="ef-hex"><b>${lab}</b> ${fa.hexT[t].winRate}% <i>（n=${fa.hexT[t].n}）</i></span>` : '';
+  const hexTopHtml = (fa.hexTop || []).slice(0, 4).map(x =>
+    `<span class="ef-hextop ${x.winRate >= 55 ? 'up' : x.winRate <= 45 ? 'down' : ''}">${x.hex}卦 ${x.winRate}%</span>`).join('');
+  el.innerHTML = `
+    <h4 class="exp-sub">📈 技术参数因子（成功共同特征 vs 失误共同原因）</h4>
+    <div class="ef-grid">
+      <div class="ef-col ef-good"><div class="ef-col-title">✅ 成功案例共同特征</div>
+        ${(fa.successFactors || []).map(fmt).join('') || '<div class="ef-empty">样本尚少</div>'}</div>
+      <div class="ef-col ef-bad"><div class="ef-col-title">⚠️ 失误案例共同原因</div>
+        ${(fa.failureFactors || []).map(fmt).join('') || '<div class="ef-empty">样本尚少</div>'}</div>
+    </div>
+    <div class="ef-insight">💡 ${fa.techInsight || '—'}</div>
+    <h4 class="exp-sub">☯ 卦象维度</h4>
+    <div class="ef-hex-row">${hexRow('多', '偏多')}${hexRow('观', '观望')}${hexRow('空', '偏空')}</div>
+    ${hexTopHtml ? `<div class="ef-hextop-row"><span class="ef-hextop-label">高胜率卦象：</span>${hexTopHtml}</div>` : ''}
+    <div class="ef-insight">💡 ${fa.hexInsight || '—'}</div>`;
+}
+async function loadExperience() {
+  const metaEl = document.getElementById('expMeta');
+  const insEl = document.getElementById('expInsights');
+  const sampEl = document.getElementById('expSamples');
+  if (metaEl) metaEl.textContent = '加载中…';
+  try {
+    const d = await fetch(`./experience_summary.json?t=${Date.now()}`).then(r => r.json());
+    experienceData = d;
+    if (metaEl) metaEl.textContent = `（共 ${d.total || 0} 条复盘样本）`;
+    const ins = d.insights || {};
+    if (insEl) {
+      const t = ins.tier || {};
+      insEl.innerHTML = `
+        <div class="ei-card"><span class="ei-label">技术命中率</span><span class="ei-value">${ins.techHitRate != null ? ins.techHitRate + '%' : '—'}</span></div>
+        <div class="ei-card"><span class="ei-label">卦象命中率</span><span class="ei-value">${ins.hexHitRate != null ? ins.hexHitRate + '%' : '—'}</span></div>
+        <div class="ei-card"><span class="ei-label">🟢低险次日涨率</span><span class="ei-value">${t.low && t.low.nextDayUpRate != null ? t.low.nextDayUpRate + '%' : '—'}</span></div>
+        <div class="ei-card"><span class="ei-label">🟡中险次日涨率</span><span class="ei-value">${t.mid && t.mid.nextDayUpRate != null ? t.mid.nextDayUpRate + '%' : '—'}</span></div>
+        <div class="ei-card"><span class="ei-label">🔴高险次日涨率</span><span class="ei-value">${t.high && t.high.nextDayUpRate != null ? t.high.nextDayUpRate + '%' : '—'}</span></div>`;
+    }
+    if (sampEl) {
+      const s = (d.samples || []).slice(0, 12);
+      sampEl.innerHTML = s.map(r => {
+        const pctCls = r.actualPct == null ? '' : (r.actualPct >= 0 ? 'up' : 'down');
+        const pct = r.actualPct == null ? '—' : `${r.actualPct >= 0 ? '+' : ''}${r.actualPct.toFixed(2)}%`;
+        const tier = r.limitUpTier ? `<span class="risk-badge lu-${r.limitUpTier}">${r.limitUpTier === 'low' ? '🟢低' : r.limitUpTier === 'mid' ? '🟡中' : '🔴高'}</span>` : '';
+        const interp = r.techInterpret || r.hexInterpret || '—';
+        return `<div class="exp-item">
+          <div class="exp-item-head"><b>${r.name}</b><span class="rev-code">${r.code}</span>${r.signal ? `<span class="exp-sig">${r.signal}</span>` : ''}${tier}
+            <span class="exp-pct ${pctCls}">${pct}</span></div>
+          <div class="exp-item-body">${interp}</div>
+        </div>`;
+      }).join('') || '<div class="rev-empty"><p>暂无典型样例</p></div>';
+    }
+    // 因子分析：成功共同特征 / 失误共同原因 / 卦象维度（每日滚动累加）
+    const facEl = document.getElementById('expFactors');
+    if (facEl) renderFactorAnalysis(d.factorAnalysis, facEl);
+  } catch (e) {
+    if (metaEl) metaEl.textContent = '加载失败（请等待下次扫描生成 experience_summary.json）';
+    if (insEl) insEl.innerHTML = '';
+  }
+}
+
+function loadReview() {
+  const date = document.getElementById('revDate').value;
+  const sumEl = document.getElementById('revSummary');
+  const listEl = document.getElementById('revList');
+  const emptyEl = document.getElementById('revEmpty');
+  if (sumEl) sumEl.innerHTML = '<div class="rev-loading">加载中…</div>';
+  if (listEl) listEl.innerHTML = '';
+  if (emptyEl) emptyEl.style.display = 'none';
+  if (!date) { if (sumEl) sumEl.textContent = '请选择入选日'; return; }
+  reviewLoaded = true;
+  fetch(`./review_${reviewType}_${date}.json?t=${Date.now()}`)
+    .then(r => { if (!r.ok) throw new Error('no review'); return r.json(); })
+    .then(d => { currentReviewData = d; renderReview(d); })
+    .catch(() => {
+      if (sumEl) sumEl.innerHTML = '';
+      if (emptyEl) emptyEl.style.display = '';
+    });
+}
+
+function renderReview(d) {
+  const sumEl = document.getElementById('revSummary');
+  const listEl = document.getElementById('revList');
+  const emptyEl = document.getElementById('revEmpty');
+  if (emptyEl) emptyEl.style.display = 'none';
+  const raw = d.reviews || [];
+  const sortBy = (document.getElementById('revSort') || {}).value || 'score-desc';
+  const rs = raw.slice().sort((a, b) => {
+    switch (sortBy) {
+      case 'score-desc': return (b.score != null ? b.score : -1) - (a.score != null ? a.score : -1);
+      case 'score-asc':  return (a.score != null ? a.score : 1e9) - (b.score != null ? b.score : 1e9);
+      case 'pct-desc':   return (b.actualPct != null ? b.actualPct : -1e9) - (a.actualPct != null ? a.actualPct : -1e9);
+      case 'pct-asc':    return (a.actualPct != null ? a.actualPct : 1e9) - (b.actualPct != null ? b.actualPct : 1e9);
+      case 'code':       return (a.code || '').localeCompare(b.code || '');
+      default: return 0;
+    }
+  });
+  const n = rs.length;
+  const hitsTech = rs.filter(r => r.hitTech === true).length;
+  const hitsHex = rs.filter(r => r.hitHex === true).length;
+  const avg = n ? (rs.reduce((s, r) => s + (r.actualPct || 0), 0) / n) : 0;
+  if (sumEl) {
+    sumEl.innerHTML = `
+      <div class="rs-card"><span class="rs-label">复盘日</span><span class="rs-value">${d.prevDate} → ${d.reviewDate}</span></div>
+      <div class="rs-card"><span class="rs-label">样本数</span><span class="rs-value">${n}</span></div>
+      <div class="rs-card"><span class="rs-label">次日平均涨跌</span><span class="rs-value ${avg >= 0 ? 'up' : 'down'}">${avg >= 0 ? '+' : ''}${avg.toFixed(2)}%</span></div>
+      <div class="rs-card"><span class="rs-label">技术命中率</span><span class="rs-value">${n ? (hitsTech / n * 100).toFixed(1) : '0'}%</span></div>
+      <div class="rs-card"><span class="rs-label">卦象命中率</span><span class="rs-value">${n ? (hitsHex / n * 100).toFixed(1) : '0'}%</span></div>`;
+  }
+  if (!listEl) return;
+  listEl.innerHTML = rs.map(r => {
+    const pct = r.actualPct == null ? '—' : `${r.actualPct >= 0 ? '+' : ''}${r.actualPct.toFixed(2)}%`;
+    const pctCls = r.actualPct == null ? '' : (r.actualPct >= 0 ? 'up' : 'down');
+    const scoreStr = r.score == null ? '—' : (+r.score).toFixed(1);
+    const sigCls = r.signal === 'BUY' ? 'buy' : (r.signal === 'SELL' ? 'sell' : '');
+    const techBadge = r.hitTech == null ? '' : `<span class="hit-badge ${r.hitTech ? 'hit' : 'miss'}">技${r.hitTech ? '中' : '失'}</span>`;
+    const hexBadge = r.hitHex == null ? '' : `<span class="hit-badge ${r.hitHex ? 'hit' : 'miss'}">卦${r.hitHex ? '中' : '失'}</span>`;
+    const changes = (r.changes && r.changes.length)
+      ? `<div class="rev-changes">变化因素：${r.changes.map(c => `<span class="chg-item">${labelParam(c.k)} <b>${fmtVal(c.from)}</b>→<b>${fmtVal(c.to)}</b></span>`).join('')}</div>`
+      : '';
+    return `<div class="rev-row">
+      <div class="rev-name"><span class="rev-name-link" data-code="${r.code}" data-name="${r.name}">${r.name}<span class="kline-ico">📈</span></span><span class="rev-code">${r.code}</span></div>
+      <div class="rev-score">${scoreStr}</div>
+      <div class="rev-sig ${sigCls}">${r.signal || '—'}</div>
+      <div class="rev-price">${r.entryPrice} → ${r.todayPrice == null ? '—' : r.todayPrice}</div>
+      <div class="rev-pct ${pctCls}">${pct}</div>
+      <div class="rev-hits">${techBadge}${hexBadge}</div>
+      ${changes}
+    </div>`;
+  }).join('');
+}
+
+function labelParam(k) {
+  const m = { maAlignment: '均线排列', macdCross: 'MACD', kdjCross: 'KDJ', rsi12: 'RSI', bollPct: '布林', obvTrend: 'OBV', flow: '主力净流入', volumeRatio: '量比', volumePrice: '量价', indexPct: '大盘', expectTech: '技术预期', expectHex: '卦象预期' };
+  return m[k] || k;
+}
+function fmtVal(v) {
+  if (v == null) return '—';
+  if (typeof v === 'number') return Math.abs(v) >= 1e8 ? (v / 1e8).toFixed(2) + '亿' : String(v);
+  return v;
+}
+
+// ============ 复盘 K线 弹窗 ============
+let revKlineInstance = null;
+const revKlineModal = document.getElementById('revKlineModal');
+const revKlineChartEl = document.getElementById('revKlineChart');
+const revKlineTitle = document.getElementById('revKlineTitle');
+const revKlineSummary = document.getElementById('revKlineSummary');
+
+function openReviewKline(code, name) {
+  if (!revKlineModal || !revKlineChartEl) return;
+  revKlineTitle.textContent = `复盘 K线 - ${name || code} (${code})`;
+  revKlineSummary.innerHTML = '<span class="rev-loading">加载K线中…</span>';
+  revKlineModal.classList.add('active');
+  if (revKlineInstance) { revKlineInstance.dispose(); revKlineInstance = null; }
+  fetchKlineClient(code, 150).then(kline => {
+    if (!kline || kline.length === 0) { revKlineSummary.innerHTML = '<span style="color:#ef4444;">无法获取K线数据</span>'; return; }
+    const stockName = name || code;
+    const data = analyzeStockClient(code, stockName, kline, MA_PERIODS, chartPrimaryMa, minStrength);
+    const rev = (currentReviewData && currentReviewData.reviews || []).find(r => r.code === code);
+    if (rev) {
+      const pctCls = rev.actualPct == null ? '' : (rev.actualPct >= 0 ? 'up' : 'down');
+      const pct = rev.actualPct == null ? '—' : `${rev.actualPct >= 0 ? '+' : ''}${rev.actualPct.toFixed(2)}%`;
+      const sigCls = rev.signal === 'BUY' ? 'up' : (rev.signal === 'SELL' ? 'down' : '');
+      const tech = rev.hitTech == null ? '—' : (rev.hitTech ? '<span class="dot-hit">中</span>' : '<span class="dot-miss">失</span>');
+      const hex = rev.hitHex == null ? '—' : (rev.hitHex ? '<span class="dot-hit">中</span>' : '<span class="dot-miss">失</span>');
+      // 涨停风险档位（若有）
+      const tierMap = { low: '🟢低险可追', mid: '🟡中险关注', high: '🔴高险追高' };
+      const tierBadge = rev.limitUpTier ? `<span class="risk-badge lu-${rev.limitUpTier}">${tierMap[rev.limitUpTier]}</span>` : '';
+      // 技中/失、卦中/失详细解读（后端优先，缺失则前端兜底生成）
+      const genInterp = (expect, actualPct, hit, kind) => {
+        if (expect == null || hit == null) return null;
+        const dir = e => e === 'up' ? '上行（涨）' : e === 'down' ? '下行（跌）' : '中性';
+        const act = actualPct == null ? '无行情数据' : (actualPct >= 0 ? '上涨 ' + actualPct.toFixed(2) + '%' : '下跌 ' + Math.abs(actualPct).toFixed(2) + '%');
+        if (hit) return `【${kind}中】${kind}信号入选时判定${dir(expect)}，次日实际${act}，方向吻合——${kind}面判断有效。`;
+        return `【${kind}失】${kind}信号入选时判定${dir(expect)}，次日实际${act}，方向相反——判断失效。可能原因：拐点为短线信号、次日即被反包；或受大盘/板块轮动/突发消息扰动；或量价背离尚未兑现。`;
+      };
+      const techInterp = rev.techInterpret || genInterp(rev.expectTech, rev.actualPct, rev.hitTech, '技');
+      const hexInterp = rev.hexInterpret || genInterp(rev.expectHex, rev.actualPct, rev.hitHex, '卦');
+      revKlineSummary.innerHTML = `
+        <div class="rev-sum-row"><span>入选价：<b>${rev.entryPrice}</b></span>
+        <span>次日价：<b>${rev.todayPrice == null ? '—' : rev.todayPrice}</b></span>
+        <span>次日涨跌：<b class="${pctCls}">${pct}</b></span>
+        <span>信号：<b class="${sigCls}">${rev.signal || '—'}</b></span>
+        <span>技：<b>${tech}</b></span>
+        <span>卦：<b>${hex}</b></span>${tierBadge}</div>
+        ${techInterp ? `<div class="rev-interp"><span class="ri-tag ri-tech">技中失解读</span><span class="ri-text">${techInterp}</span></div>` : ''}
+        ${hexInterp ? `<div class="rev-interp"><span class="ri-tag ri-hex">卦中失解读</span><span class="ri-text">${hexInterp}</span></div>` : ''}`;
+    }
+    // modal 从 display:none 切换后需等布局完成，否则 echarts 取不到容器尺寸
+    requestAnimationFrame(() => {
+      revKlineInstance = echarts.init(revKlineChartEl);
+      revKlineInstance.setOption(buildKlineOption(data));
+      revKlineInstance.resize();
+    });
+  }).catch(e => {
+    revKlineSummary.innerHTML = `<span style="color:#ef4444;">加载失败：${(e && e.message) || e}</span>`;
+  });
+}
+
+function closeReviewKline() {
+  if (revKlineModal) revKlineModal.classList.remove('active');
+  if (revKlineInstance) { revKlineInstance.dispose(); revKlineInstance = null; }
+}
+
+// ============ 参数统计视图 ============
+function enterStatsView() {
+  activeTab = 'stats';
+  resultsSection.style.display = 'none';
+  emptyState.style.display = 'none';
+  if (positionSection) positionSection.style.display = 'none';
+  if (favoriteSection) favoriteSection.style.display = 'none';
+  const revSec = document.getElementById('reviewSection'); if (revSec) revSec.style.display = 'none';
+  const stSec = document.getElementById('statsSection'); if (stSec) stSec.style.display = '';
+  bindStatsUI();
+  loadStats();
+}
+
+function exitStatsView() {
+  const stSec = document.getElementById('statsSection'); if (stSec) stSec.style.display = 'none';
+  typeTabs.forEach(x => x.classList.toggle('active', x.dataset.type === currentType));
+  activeTab = currentType;
+}
+
+function bindStatsUI() {
+  const sec = document.getElementById('statsSection');
+  if (!sec || sec._bound) return;
+  sec._bound = true;
+  const btn = document.getElementById('statsRefreshBtn');
+  if (btn) btn.onclick = () => loadStats();
+}
+
+function loadStats() {
+  const rankEl = document.getElementById('statsRank');
+  const metaEl = document.getElementById('statsMeta');
+  const emptyEl = document.getElementById('statsEmpty');
+  const detailEl = document.getElementById('statsDetail');
+  if (rankEl) rankEl.innerHTML = '<div class="rev-loading">加载中…</div>';
+  if (detailEl) detailEl.innerHTML = '';
+  if (emptyEl) emptyEl.style.display = 'none';
+  fetch(`./param_stats.json?t=${Date.now()}`)
+    .then(r => { if (!r.ok) throw new Error('no stats'); return r.json(); })
+    .then(d => renderStats(d, metaEl, rankEl, emptyEl, detailEl))
+    .catch(() => {
+      if (rankEl) rankEl.innerHTML = '';
+      if (emptyEl) emptyEl.style.display = '';
+    });
+}
+
+function renderStats(d, metaEl, rankEl, emptyEl, detailEl) {
+  if (emptyEl) emptyEl.style.display = 'none';
+  if (metaEl) metaEl.textContent = d.totalSamples ? `（样本 ${d.totalSamples} · ${d.dateRange ? d.dateRange.join(' ~ ') : ''}）` : '';
+  const ranking = d.ranking || [];
+  if (!rankEl) return;
+  rankEl.innerHTML = `
+    <table class="stats-table">
+      <thead><tr><th>排名</th><th>参数</th><th>区分度(spread)</th><th>最佳组</th><th>最差组</th></tr></thead>
+      <tbody>
+        ${ranking.map((r, i) => `<tr class="stats-row" data-key="${r.key}">
+          <td>${i + 1}</td>
+          <td>${labelParam(r.key)}</td>
+          <td class="${r.spread > 1 ? 'up' : (r.spread < -1 ? 'down' : '')}">${r.spread}</td>
+          <td>${r.best || '—'}</td>
+          <td>${r.worst || '—'}</td>
+        </tr>`).join('')}
+      </tbody>
+    </table>`;
+  rankEl.querySelectorAll('.stats-row').forEach(tr => tr.addEventListener('click', () => {
+    rankEl.querySelectorAll('.stats-row').forEach(x => x.classList.remove('sel'));
+    tr.classList.add('sel');
+    renderStatsDetail(d, tr.dataset.key, detailEl);
+  }));
+  if (ranking.length && detailEl) renderStatsDetail(d, ranking[0].key, detailEl);
+  // 因子分析：成功共同特征 / 失误共同原因 / 卦象维度（每日滚动累加）
+  renderFactorAnalysis(d.factorAnalysis, document.getElementById('statsFactors'));
+}
+
+function renderStatsDetail(d, key, detailEl) {
+  if (!detailEl) return;
+  const p = (d.params && d.params[key]) || {};
+  const groups = p.groups || {};
+  const rows = Object.entries(groups).map(([gk, g]) => `
+    <tr>
+      <td>${gk}</td>
+      <td>${g.n}</td>
+      <td class="${g.avgPct >= 0 ? 'up' : 'down'}">${g.avgPct >= 0 ? '+' : ''}${g.avgPct}%</td>
+      <td>${g.techHitRate == null ? '—' : g.techHitRate + '%'}</td>
+      <td>${g.hexHitRate == null ? '—' : g.hexHitRate + '%'}</td>
+    </tr>`).join('');
+  detailEl.innerHTML = `
+    <h4>${labelParam(key)} · 分组明细（区分度 ${p.spread}）</h4>
+    <table class="stats-table detail">
+      <thead><tr><th>取值区间/类别</th><th>样本数</th><th>次日平均涨跌</th><th>技术命中率</th><th>卦象命中率</th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table>`;
 }
 
 // ---------- 持仓渲染 ----------

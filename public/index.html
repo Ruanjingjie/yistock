@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>智能选股助手 - 日均线导数分析</title>
-  <link rel="stylesheet" href="style.css">
+  <link rel="stylesheet" href="style.css?v=20260820-2355">
   <script src="https://cdn.jsdelivr.net/npm/echarts@5.4.3/dist/echarts.min.js"></script>
 </head>
 <body>
@@ -26,6 +26,11 @@
         </div>
         <button class="sub-btn" id="subBtn">订阅</button>
         <span class="sub-badge off" id="subBadge">未订阅</span>
+        <div class="mh-birth-global" title="梅花易数运势：请输入「农历」生辰八字（年/月/日/时），筛选出的股票会自动结合你的八字起卦（仅供娱乐，不计入评分）">
+          <label title="请填农历（阴历）生辰">📿 农历生辰</label>
+          <input type="datetime-local" id="globalBirth" class="mh-input-sm" placeholder="农历 年-月-日 时" />
+        </div>
+        <button class="score-help-btn" id="scoreHelpBtn" title="综合评分是怎么算出来的？">ⓘ 评分说明</button>
       </div>
     </header>
 
@@ -34,8 +39,11 @@
       <button class="type-tab active" data-type="stock">A股 · 尾盘快照</button>
       <button class="type-tab" data-type="cb">可转债 · 尾盘快照</button>
       <button class="type-tab" data-type="etf">ETF · 尾盘快照</button>
+      <button class="type-tab tab-precursor" data-type="precursor">🚀 前兆 · 低位启动</button>
       <button class="type-tab tab-pos" data-type="position">💼 持仓<span class="tab-badge" id="posTabBadge" style="display:none;">0</span></button>
       <button class="type-tab tab-fav" data-type="favorite">⭐ 收藏<span class="tab-badge" id="favTabBadge" style="display:none;">0</span></button>
+      <button class="type-tab tab-review" data-type="review">📊 复盘</button>
+      <button class="type-tab tab-stats" data-type="stats">📈 参数统计</button>
     </nav>
 
     <!-- 云端尾盘快照信息条（服务端 14:30 自动生成，前端只排序/筛选） -->
@@ -56,6 +64,16 @@
         <button class="snap-chip" data-board="kcb">科创板</button>
         <span class="snap-sep"></span>
         <button class="snap-chip" id="snapFlowChip" data-flow="1">仅看主力净流入</button>
+        <span class="snap-sep"></span>
+        <span class="snap-flabel">技术：</span>
+        <button class="snap-chip active" data-tech="all">全部</button>
+        <button class="snap-chip" data-tech="buy">📈 入</button>
+        <button class="snap-chip" data-tech="sell">📉 出</button>
+        <span class="snap-sep"></span>
+        <span class="snap-flabel">易经：</span>
+        <button class="snap-chip active" data-hex="all">全部</button>
+        <button class="snap-chip" data-hex="in">☰ 入</button>
+        <button class="snap-chip" data-hex="out">☷ 出</button>
       </div>
     </section>
 
@@ -178,6 +196,7 @@
             <option value="strength-asc">曲率强度 ↑ 低→高</option>
             <option value="change-desc">涨跌幅 ↓ 高→低</option>
             <option value="change-asc">涨跌幅 ↑ 低→高</option>
+            <option value="score-desc">综合分 ↓ 高→低</option>
           </select>
           <select id="dateFilter" class="sort-select" title="按信号出现日期筛选">
             <option value="all">📅 日期不限</option>
@@ -317,6 +336,82 @@
         收藏为<strong>纯观察清单</strong>，不产生任何真实交易。数据仅保存在您本机浏览器中，提醒仅在页面打开时巡检，开启见「🔔 提醒设置」。
       </p>
     </section>
+
+    <!-- ============ 复盘页面 ============ -->
+    <section class="review-section" id="reviewSection" style="display:none;">
+      <div class="rev-tabs" id="revTabs">
+        <button class="rev-tab active" data-rtab="review">📊 复盘列表</button>
+        <button class="rev-tab" data-rtab="exp">📚 经验总结</button>
+      </div>
+      <div class="rev-pane" id="reviewPane">
+        <div class="rev-toolbar">
+        <div class="rev-type">
+          <span class="rev-type-label">品种：</span>
+          <button class="rev-type-btn active" data-rt="stock">A股</button>
+          <button class="rev-type-btn" data-rt="cb">可转债</button>
+          <button class="rev-type-btn" data-rt="etf">ETF</button>
+        </div>
+        <label class="rev-date-label">入选日：</label>
+        <input type="date" id="revDate" class="date-input" />
+        <button id="revPrevBtn" class="btn btn-secondary">前一天</button>
+        <button id="revLoadBtn" class="btn btn-primary">加载复盘</button>
+        <label class="rev-sort-label">排序：</label>
+        <select id="revSort" class="sort-select">
+          <option value="score-desc">分数(高→低)</option>
+          <option value="score-asc">分数(低→高)</option>
+          <option value="pct-desc">实际涨跌(高→低)</option>
+          <option value="pct-asc">实际涨跌(低→高)</option>
+          <option value="code">代码</option>
+        </select>
+      </div>
+      <div class="rev-note">对比「入选日」的入选股与次一交易日的实际表现，高亮记录引起变化的因素。数据需次日扫描后生成（若显示无数据，请次日再来）。</div>
+      <div class="rev-legend">
+        <span class="lg">价格/信号：<span class="up">红=涨/入场</span> · <span class="down">绿=跌/出场</span>（A股惯例）</span>
+        <span class="lg">命中徽章：<span class="dot-hit">中</span>=方向猜对 · <span class="dot-miss">失</span>=方向猜错（青/橙，与涨跌配色无关）</span>
+        <span class="lg">点股票名 📈 看复盘 K线</span>
+      </div>
+      <div class="rev-summary" id="revSummary"></div>
+      <div class="rev-list" id="revList"></div>
+      <div class="rev-empty" id="revEmpty" style="display:none;">
+        <span class="empty-icon">📊</span>
+        <p>暂无该日的复盘数据</p>
+        <p class="empty-hint">复盘文件在次日扫描时自动生成。若今天是新策略首日，请明天 14:30 后再来查看；或确认所选「入选日」是否正确。</p>
+      </div>
+      </div>
+
+      <div class="rev-pane" id="expPane" style="display:none;">
+        <div class="exp-head">
+          <h3>📚 经验总结 <span class="exp-meta" id="expMeta"></span></h3>
+          <button id="expCloseBtn" class="btn btn-secondary">← 返回复盘列表</button>
+        </div>
+        <div class="exp-note">自动沉淀每日复盘的「技术命中/失手、卦象命中/失手」解读与次日实际涨跌，供你回看规律。数据保存在本仓库 <code>public/experience_summary.json</code>，随每日扫描累积。</div>
+        <div class="exp-insights" id="expInsights"></div>
+        <div id="expFactors" class="exp-factors"></div>
+        <h4 class="exp-sub">典型样例（技失 / 卦失 / 高险票）</h4>
+        <div class="exp-samples" id="expSamples"></div>
+      </div>
+    </section>
+
+    <!-- ============ 参数统计页面 ============ -->
+    <section class="stats-section" id="statsSection" style="display:none;">
+      <div class="stats-head">
+        <h3>参数影响力统计 <span class="stats-meta" id="statsMeta"></span></h3>
+        <button id="statsRefreshBtn" class="btn btn-scan">🔄 重新加载</button>
+      </div>
+      <div class="stats-note">累积每日复盘样本，对每个参数做「取值分组 → 次日平均涨跌 / 命中率」分析，按区分度（组内涨跌差异）排出影响力排行。样本越多越准。易经卦象命中率仅作趣味性验证，不构成投资建议。</div>
+      <div id="statsFactors" class="exp-factors"></div>
+      <div class="stats-rank" id="statsRank"></div>
+      <div class="stats-detail" id="statsDetail"></div>
+      <div class="rev-empty" id="statsEmpty" style="display:none;">
+        <span class="empty-icon">📈</span>
+        <p>暂无统计样本</p>
+        <p class="empty-hint">需累积至少一天的复盘数据。请次日 14:30 扫描后，再到此查看参数影响力排行。</p>
+      </div>
+    </section>
+
+    <!-- ============ 梅花易数（娱乐参考，不计入评分） ============ -->
+    <!-- 生辰在右上角全局输入一次；筛选出的股票自动结合八字起卦，见各股 K线 详情 -->
+
   </div>
 
   <!-- 图表弹窗 -->
@@ -336,6 +431,8 @@
       </div>
       <div class="modal-body">
         <div class="chart-principle" id="chartPrinciple"></div>
+        <div class="chart-news" id="chartNews"></div>
+        <div class="chart-score" id="chartScore"></div>
         <div class="chart-info" id="chartInfo"></div>
         <div class="chart-extra">
           <div class="chart-flow" id="chartFlow"></div>
@@ -369,6 +466,29 @@
           <h4>近期信号记录</h4>
           <div id="signalRecords"></div>
         </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ============ 复盘 K线 弹窗 ============ -->
+  <div class="modal" id="revKlineModal">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h3 id="revKlineTitle">复盘 K线</h3>
+        <div class="modal-actions">
+          <button class="modal-close" id="revKlineClose">&times;</button>
+        </div>
+      </div>
+      <div class="modal-body">
+        <div class="rev-kline-summary" id="revKlineSummary"></div>
+        <div class="chart-toolbar">
+          <span class="ct-legend">
+            <i class="ct-dot buy"></i>入场(红=预测涨)
+            <i class="ct-dot sell"></i>出场(绿=预测跌)
+            <span class="ct-tip">K线蜡烛：红涨绿跌（A股惯例）</span>
+          </span>
+        </div>
+        <div id="revKlineChart" class="chart-container"></div>
       </div>
     </div>
   </div>
@@ -573,6 +693,32 @@
     </div>
   </div>
 
-  <script src="app.js"></script>
+  <!-- ============ 综合评分说明弹窗 ============ -->
+  <div class="modal score-help-modal" id="scoreHelpModal">
+    <div class="modal-content score-help-content">
+      <div class="modal-header">
+        <h3>ⓘ 综合评分是怎么算出来的？</h3>
+        <button class="modal-close" id="scoreHelpCloseBtn">&times;</button>
+      </div>
+      <div class="modal-body score-help-body">
+        <p class="sh-lead">每只股票按 <b>5 个维度</b> 分别打分（0–100），再按权重加权求和得到 <b>综合分</b>。各参数缺失时按中性 50 分计，评分照常出。</p>
+        <div class="sh-formula">综合分 = 技术×45% + 资金×25% + 情绪×15% + 基本面×10% + 事件×5%</div>
+        <table class="sh-table">
+          <thead><tr><th>维度</th><th>权重</th><th>包含的子项（组内再加权）</th></tr></thead>
+          <tbody>
+            <tr><td><b>技术</b></td><td>45%</td><td>均线排列、MACD 叉形、KDJ 叉形、RSI(12)、BOLL 百分位、OBV 能量潮、量价配合</td></tr>
+            <tr><td><b>资金</b></td><td>25%</td><td>主力净流入、量比、换手率、资金趋势</td></tr>
+            <tr><td><b>情绪</b></td><td>15%</td><td>沪指涨跌幅、创业板涨跌幅（市场级共振，不分个股）</td></tr>
+            <tr><td><b>基本面</b></td><td>10%</td><td>市盈率 PE、市净率 PB</td></tr>
+            <tr><td><b>事件</b></td><td>5%</td><td>行业关联的手动/新闻事件（辅助提示，不喧宾夺主）</td></tr>
+          </tbody>
+        </table>
+        <p class="sh-note">点开任意一只股票的 <b>K线详情</b>，可在「综合评分拆解」里看到这只票<b>每个维度的分数、每个子项的原始值和打分理由</b>。</p>
+        <p class="sh-note sh-warn">⚠️ 事件面（5%）由<b>自动抓取的相关新闻</b>经行业匹配与情绪打分后注入（<code>news_cache.json</code>），亦可用 <code>manual_events.json</code> 手动补充。行情/技术指标引擎本身只认价格与成交量，新闻情绪为辅助提示。梅花易数运势为纯娱乐，<b>不计入综合评分</b>。</p>
+      </div>
+    </div>
+  </div>
+
+  <script src="app.js?v=20260820-2355"></script>
 </body>
 </html>
