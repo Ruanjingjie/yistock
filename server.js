@@ -13,7 +13,9 @@
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
-const { runScan, SNAPSHOT_PATHS } = require('./scanner');
+const { runScan, SNAPSHOT_PATHS, runReview, computeStats, buildExperience, findPrevPicksDate, getChinaDateStr } = require('./scanner');
+const { main: fetchNews } = require('./news_fetcher');
+const { run: runBacktest } = require('./backtest');
 
 const PUBLIC_DIR = path.join(__dirname, 'public');
 const SNAPSHOT_PATH = path.join(PUBLIC_DIR, 'snapshot.json');
@@ -93,11 +95,26 @@ async function doScan(res) {
   }
   scanning = true;
   try {
+    // 先刷新自动新闻（二期：相关新闻自动抓取），供本次扫描的事件面使用；失败不阻塞扫描
+    try { await fetchNews(); console.log('[scan] 新闻抓取完成'); }
+    catch (e) { console.error('[scan] 新闻抓取失败(继续扫描):', e.message); }
     const summary = [];
-    for (const type of ['stock', 'cb', 'etf']) {
+    for (const type of ['stock', 'cb', 'etf', 'precursor']) {
       const snap = await runScan({ type });
       summary.push(`${type}:${snap.count}`);
+      // 复盘前一天（跑两天观察事件面影响需要日积月累的复盘样本）
+      try {
+        const tradeDate = getChinaDateStr();
+        const prev = findPrevPicksDate(type, tradeDate);
+        if (prev) { const rf = await runReview(prev, tradeDate, type); console.log(`[scan] 复盘 ${type} ${prev}: ${rf || '跳过'}`); }
+      } catch (e) { console.error(`[scan] 复盘 ${type} 失败:`, e.message); }
     }
+    // 更新参数影响力统计
+    try { const sf = computeStats(); console.log('[scan] 参数统计更新:', sf || '跳过'); } catch (e) { console.error('[scan] 参数统计失败:', e.message); }
+    // 沉淀经验总结（技中/失、卦中/失解读）
+    try { const ef = buildExperience(); console.log('[scan] 经验总结更新:', ef || '跳过'); } catch (e) { console.error('[scan] 经验总结失败:', e.message); }
+    // 更新回测报告（综合评分/事件面策略有效性）
+    try { runBacktest('stock'); console.log('[scan] 回测报告已更新'); } catch (e) { console.error('[scan] 回测失败:', e.message); }
     console.log(`[scan] 完成 [${summary.join(' ')}]`);
     if (res) { res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' }); res.end(JSON.stringify({ ok: true, summary })); }
   } catch (e) {
@@ -158,8 +175,14 @@ const server = http.createServer(async (req, res) => {
 server.listen(PORT, () => {
   console.log(`[server] 监听 http://localhost:${PORT}`);
   schedule();
+  // 启动时若新闻缓存缺失则先抓一次（供首次扫描事件面使用）
+  const newsCacheFile = path.join(PUBLIC_DIR, 'news_cache.json');
+  if (!fs.existsSync(newsCacheFile)) {
+    console.log('[server] 未检测到新闻缓存，启动时抓取一次...');
+    fetchNews().catch(e => console.error('[server] 启动抓取新闻失败:', e.message));
+  }
   // 启动时若任一快照缺失则生成一次，便于部署后立即有数据
-  const missing = ['stock', 'cb', 'etf'].filter(t => !fs.existsSync(SNAPSHOT_PATHS[t]));
+  const missing = ['stock', 'cb', 'etf', 'precursor'].filter(t => !fs.existsSync(SNAPSHOT_PATHS[t]));
   if (missing.length) {
     console.log(`[server] 未检测到快照(${missing.join(',')})，启动时生成一次...`);
     doScan(null);
