@@ -30,6 +30,8 @@ jobs:
           node-version: 20
 
       - name: 运行每日扫描（stock/cb/etf/precursor + 复盘 + 参数统计 + 经验总结 + 回测）
+        timeout-minutes: 15
+        continue-on-error: true
         run: node scanner.js
 
       - name: 把新生成的数据提交回 main（供下次复盘累积）
