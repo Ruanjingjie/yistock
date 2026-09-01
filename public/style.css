@@ -28,8 +28,9 @@ body {
 /* ===== Header ===== */
 .header {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
-  gap: 12px;
+  gap: 10px 12px;
   padding: 14px 16px;
   background: linear-gradient(135deg, #1a1d29 0%, #252836 100%);
   border-radius: 12px;
@@ -38,8 +39,23 @@ body {
 }
 
 .header-left {
-  flex: 1;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex: 1 1 auto;
   min-width: 0;
+}
+
+.header-right {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 10px;
+  flex: 1 1 100%;
+}
+
+.header-right .signal-stats {
+  margin-top: 0;
 }
 
 .logo {
